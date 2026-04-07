@@ -22,6 +22,15 @@ class Observation(BaseModel):
         ...,
         description="Captured standard error from the most recent shell command.",
     )
+    # --- Added to satisfy OpenEnv alpha serialization quirks ---
+    reward: float = Field(
+        default=0.0,
+        description="Current reward value for the state.",
+    )
+    done: bool = Field(
+        default=False,
+        description="Flag indicating if the task is complete.",
+    )
 
 
 class Action(BaseModel):
