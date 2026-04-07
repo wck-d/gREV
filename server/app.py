@@ -37,15 +37,12 @@ except Exception as e:  # pragma: no cover
 
 try:
     from grev.models import Action, Observation
-    from .temp_env_environment import TempEnvironment
 except ModuleNotFoundError:
     from grev.models import Action, Observation
-    from server.temp_env_environment import TempEnvironment
 
 
 # Create the app with web interface and README integration
 app = create_app(
-    TempEnvironment,
     Action,
     Observation,
     env_name="gREV",
