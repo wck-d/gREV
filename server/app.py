@@ -36,23 +36,23 @@ except Exception as e:  # pragma: no cover
     ) from e
 
 try:
-    from ..models import TempAction, TempObservation
+    from grev.models import Action, Observation
     from .temp_env_environment import TempEnvironment
 except ModuleNotFoundError:
-    from models import TempAction, TempObservation
+    from grev.models import Action, Observation
     from server.temp_env_environment import TempEnvironment
 
 
 # Create the app with web interface and README integration
 app = create_app(
     TempEnvironment,
-    TempAction,
-    TempObservation,
-    env_name="temp_env",
+    Action,
+    Observation,
+    env_name="gREV",
     max_concurrent_envs=1,  # increase this number to allow more concurrent WebSocket sessions
 )
 
-
+`
 def main(host: str = "0.0.0.0", port: int = 8000):
     """
     Entry point for direct execution via uv run or python -m.
