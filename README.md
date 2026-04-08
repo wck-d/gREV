@@ -1,4 +1,20 @@
-
+---
+title: gREV
+emoji: 🛠️
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_port: 7860
+pinned: false
+short_description: RL sandbox for autonomous coding agents.
+tags:
+  - openenv
+  - reinforcement-learning
+  - agents
+  - devops
+  - python
+  - hackathon
+---
 
 # gREV
 
