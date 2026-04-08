@@ -2,20 +2,23 @@ import subprocess
 import re
 import sys
 from fastapi import Request
+from fastapi.responses import JSONResponse # Added missing import
 from openenv.core.env_server import create_app
 from grev.env import gREVEnv
-from grev.models import Action, Observation  # <--- Add this import!
+from grev.models import Action, Observation 
 
 # 1. Initialize the OpenEnv app with the required Pydantic models
-app = create_app(gREVEnv, Action, Observation) # <--- Pass them here!
+app = create_app(gREVEnv, Action, Observation) 
 
 
 @app.get("/")
 async def root_health():
+    # Fixed: JSONResponse is now imported correctly
     return JSONResponse(content={"status": "healthy", "message": "gREV is alive!"})
 
 @app.get("/health")
 async def explicit_health():
+    # Fixed: JSONResponse is now imported correctly
     return JSONResponse(content={"status": "healthy"})
 
 # ==========================================
