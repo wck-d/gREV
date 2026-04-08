@@ -1,4 +1,4 @@
-# gREV — RepoRescueEnv
+# gREV
 
 > An OpenEnv-compliant environment where AI agents are dropped into broken Python repositories and must debug them until the full `pytest` suite passes.
 
