@@ -1,43 +1,78 @@
-import uvicorn
+import subprocess
+import re
+import sys
 from fastapi import Request
-from fastapi.responses import JSONResponse
-from openenv_core.env_server import create_app
+from openenv.core.env_server import create_app
 from grev.env import gREVEnv
-from grev.models import Action, Observation
+from grev.models import Action, Observation  # <--- Add this import!
 
-def env_factory():
-    return gREVEnv(task_level="easy")
+# 1. Initialize the OpenEnv app with the required Pydantic models
+app = create_app(gREVEnv, Action, Observation) # <--- Pass them here!
 
-# Build the base ASGI app
-app = create_app(
-    env=env_factory,
-    action_cls=Action,
-    observation_cls=Observation,
-)
 
-# --- INJECT CUSTOM ENDPOINTS FOR VALIDATOR COMPLIANCE ---
+@app.get("/")
+async def root_health():
+    return JSONResponse(content={"status": "healthy", "message": "gREV is alive!"})
 
 @app.get("/health")
-def health():
-    # Exactly matching the spec string
-    return {"status": "ok", "tasks": ["easy", "medium", "hard"]}
+async def explicit_health():
+    return JSONResponse(content={"status": "healthy"})
 
+# ==========================================
+# 2. HACKATHON SURVIVAL: ROUTE HIJACKING
+# Strip the framework's broken default /grade route so it stops ignoring our workspace
+# ==========================================
+for route in list(app.routes):
+    if hasattr(route, "path") and route.path == "/grade":
+        app.routes.remove(route)
+
+# 3. Inject our Deterministic, Workspace-Aware Grader
 @app.post("/grade")
-async def grade(request: Request):
-    # Receives final episode metrics and returns the standardized grading payload
-    data = await request.json()
-    return JSONResponse({
-        "total_reward": data.get("total_reward", 0.0),
-        "steps_taken": data.get("steps_taken", 0),
-        "success": data.get("success", False),
-        "breakdown": {
-            "syntax_valid": True,
-            "tests_passed": data.get("success", False)
+async def hackathon_grader(request: Request):
+    try:
+        # We explicitly target the workspace where the AI just wrote the code!
+        result = subprocess.run(
+            f"{sys.executable} -m pytest", 
+            shell=True, 
+            cwd="/tmp/grev_workspace", 
+            capture_output=True, 
+            text=True, 
+            timeout=10
+        )
+        stdout = result.stdout or ""
+        
+        # Perfect Score
+        if result.returncode == 0:
+            return {
+                "total_reward": 1.0, 
+                "success": True, 
+                "steps_taken": 10,
+                "breakdown": {"status": "all_tests_passed"}
+            }
+            
+        # Partial Score Parsing (Meaningful Reward Shaping)
+        passed = 0
+        failed = 0
+        passed_match = re.search(r"(\d+)\s+passed", stdout)
+        failed_match = re.search(r"(\d+)\s+failed", stdout)
+        
+        if passed_match: 
+            passed = int(passed_match.group(1))
+        if failed_match: 
+            failed = int(failed_match.group(1))
+            
+        total = passed + failed
+        score = passed / total if total > 0 else 0.0
+        
+        return {
+            "total_reward": float(score),
+            "success": False,
+            "steps_taken": 10,
+            "breakdown": {"passed": passed, "failed": failed}
         }
-    })
-
-def main():
-    uvicorn.run("server.app:app", host="0.0.0.0", port=7860)
-
-if __name__ == "__main__":
-    main()
+    except Exception as e:
+        return {
+            "total_reward": 0.0, 
+            "success": False, 
+            "breakdown": {"error": str(e)}
+        }
