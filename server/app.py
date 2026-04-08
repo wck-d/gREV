@@ -3,6 +3,7 @@ import re
 import sys
 from fastapi import Request
 from openenv.core.env_server import create_app
+from fastapi.responses import JSONResponse
 from grev.env import gREVEnv
 from grev.models import Action, Observation  # <--- Add this import!
 
