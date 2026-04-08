@@ -11,7 +11,7 @@ from grev.models import Action, Observation
 app = create_app(gREVEnv, Action, Observation) 
 
 
-@app.get("/")
+@app.get("/") 
 async def root_health():
     # Fixed: JSONResponse is now imported correctly
     return JSONResponse(content={"status": "healthy", "message": "gREV is alive!"})
