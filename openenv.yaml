@@ -2,8 +2,7 @@ name: grev-openenv
 version: "1.0.0"
 description: >
   OpenEnv environment where AI agents are dropped into broken Python
-  repositories and must diagnose and fix them — using real shell commands
-  and file edits — until the full pytest suite passes.
+  repositories and must fix them using only shell commands and file edits.
 Grading is fully deterministic: score = pytest_passed / pytest_total.
 tags:
   - openenv
