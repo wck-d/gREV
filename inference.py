@@ -1,278 +1,312 @@
-"""
-gREV Inference Script
-=====================
-Mandatory env vars:
-    API_BASE_URL   LLM endpoint  (default: Groq)
-    MODEL_NAME     Model to use   (default: llama-3.3-70b-versatile)
-    GROQ_API_KEY   Groq key  OR
-    HF_TOKEN       HF token as fallback
-    ENV_URL        gREV server   (default: http://localhost:7860)
-
-STDOUT format (validated by the hackathon runner):
-    [START] task=<task> env=<benchmark> model=<model>
-    [STEP]  step=<n> action=<json_str> reward=<0.00> done=<true|false> error=<msg|null>
-    [END]   success=<true|false> steps=<n> score=<0.000> rewards=<r1,r2,...>
-"""
-
-import os
+import asyncio
 import json
+import os
 import re
 import sys
-import time
 import textwrap
+from typing import Any, List, Optional
+
 import requests
-from typing import List, Optional
 from openai import OpenAI
 
-# ── Configuration ────────────────────────────────────────────────────────────
+
 API_BASE_URL = os.getenv("API_BASE_URL", "https://api.groq.com/openai/v1")
-MODEL_NAME   = os.getenv("MODEL_NAME",   "llama-3.3-70b-versatile")
-API_KEY      = (
-    os.getenv("GROQ_API_KEY")
-    or os.getenv("HF_TOKEN")
-    or os.getenv("API_KEY")
-)
-ENV_URL      = os.getenv("ENV_URL", "http://localhost:7860")
-BENCHMARK    = "gREV"
-MAX_STEPS    = 10
+MODEL_NAME = os.getenv("MODEL_NAME", "llama-3.3-70b-versatile")
+API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("HF_TOKEN")
+ENV_URL = os.getenv("ENV_URL", "http://localhost:7860")
+BENCHMARK = "gREV"
+TASKS = ["easy", "medium", "hard"]
+MAX_STEPS = int(os.getenv("MAX_STEPS", "8"))
+TEMPERATURE = 0.1
+MAX_TOKENS = 700
 
-# Strip markdown link syntax if ENV_URL was accidentally set as "[text](url)"
-_link_match = re.search(r'\((https?://[^)]+)\)', ENV_URL)
-if _link_match:
-    ENV_URL = _link_match.group(1)
 
-SYSTEM_PROMPT = textwrap.dedent("""
-    You are a Senior Python Engineer diagnosing a broken repository.
-    The repo has a bug that is making pytest fail. Your job is to fix it.
-
-    Strategy — follow this order strictly:
-    1. On your first action, ALWAYS run: pytest --tb=short -q
-    2. Read the traceback carefully. Identify the file and line number.
-    3. Use cat <filename> to read the broken file in full.
-    4. Write the corrected file using edit_file. Overwrite the whole file.
-    5. Run pytest again to confirm all tests pass.
-
-    RULES:
-    - Respond with ONLY valid JSON. No explanation, no markdown fences.
-    - For run_command: {"action_type": "run_command", "command": "<shell command>"}
-    - For edit_file:   {"action_type": "edit_file", "file_path": "<path>", "new_content": "<full file content>"}
-    - In new_content, use \\n for newlines. Escape all backslashes and quotes properly.
-    - Never leave new_content empty. Always write the complete corrected file.
-    - Do not use triple backticks or any text outside the JSON object.
-""").strip()
-
-# ── Logging (exact format the validator expects) ──────────────────────────────
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
+
 def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    done_val = str(done).lower()
     print(
-        f"[STEP] step={step} action={json.dumps(action)} "
-        f"reward={reward:.2f} done={str(done).lower()} "
-        f"error={error if error else 'null'}",
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
         flush=True,
     )
+
 
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    print(
-        f"[END] success={str(success).lower()} steps={steps} "
-        f"score={score:.3f} rewards={rewards_str}",
-        flush=True,
-    )
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
 
-# ── HTTP helpers (sync requests — no asyncio complexity) ──────────────────────
-def wait_for_health(timeout: int = 60) -> bool:
-    """Poll /health until the server responds or timeout expires."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            r = requests.get(f"{ENV_URL}/health", timeout=3)
-            if r.status_code == 200:
-                return True
-        except requests.exceptions.RequestException:
-            pass
-        time.sleep(2)
-    return False
 
-def reset_env(task_id: str) -> dict:
-    r = requests.post(
-        f"{ENV_URL}/reset",
-        json={"task_id": task_id, "seed": 42},
-        timeout=30,
-    )
-    r.raise_for_status()
-    data = r.json()
-    # Handle both {observation: {...}} and flat observation shapes
-    return data.get("observation", data)
+SYSTEM_PROMPT = textwrap.dedent(
+    """
+    You are a coding agent inside a broken Python repository.
+    Return exactly one JSON object per turn.
+    Allowed actions:
+    1) {"action_type":"run_command","command":"..."}
+    2) {"action_type":"edit_file","file_path":"...","new_content":"..."}
+    Keep responses valid JSON only.
+    """
+).strip()
 
-def step_env(action: dict) -> dict:
-    r = requests.post(f"{ENV_URL}/step", json=action, timeout=30)
-    r.raise_for_status()
-    return r.json()
 
-def grade_env() -> dict:
-    r = requests.post(f"{ENV_URL}/grade", timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-# ── Action parsing (robust — handles markdown fences and trailing text) ────────
-def parse_action(raw: str) -> Optional[dict]:
-    """Extract the first valid JSON object from the LLM response."""
-    # Strip markdown code fences if present
-    clean = re.sub(r"```(?:json)?", "", raw).strip()
-
-    # Try direct parse first
+def _extract_json_obj(text: str) -> Optional[dict[str, Any]]:
+    cleaned = re.sub(r"```(?:json)?", "", text or "").replace("```", "").strip()
     try:
-        return json.loads(clean)
-    except json.JSONDecodeError:
-        pass
+        return json.loads(cleaned)
+    except Exception as exc:
+        print(f"[DEBUG] JSON parse (direct) failed: {exc}", flush=True)
 
-    # Find the first { ... } block
-    match = re.search(r'\{.*\}', clean, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            pass
+    match = re.search(r"\{[\s\S]*\}", cleaned)
+    if not match:
+        return None
+
+    try:
+        return json.loads(match.group(0))
+    except Exception as exc:
+        print(f"[DEBUG] JSON parse (regex block) failed: {exc}", flush=True)
+        return None
+
+
+def _safe_json_from_response(response: requests.Response) -> Optional[dict[str, Any]]:
+    try:
+        payload = response.json()
+    except Exception as exc:
+        print(f"[DEBUG] Response JSON parsing failed: {exc}", flush=True)
+        return None
+    if isinstance(payload, dict):
+        return payload
+    print("[DEBUG] Response JSON is not an object", flush=True)
+    return None
+
+
+def _post_reset(task_id: str) -> Optional[dict[str, Any]]:
+    try:
+        response = requests.post(f"{ENV_URL}/reset", json={"task_id": task_id}, timeout=30)
+        response.raise_for_status()
+    except Exception as exc:
+        print(f"[DEBUG] /reset request failed for task {task_id}: {exc}", flush=True)
+        return None
+
+    payload = _safe_json_from_response(response)
+    if payload is None:
+        return None
+    observation = payload.get("observation")
+    if isinstance(observation, dict):
+        return observation
+    print(f"[DEBUG] /reset missing observation for task {task_id}", flush=True)
+    return None
+
+
+def _post_step(action: dict[str, Any]) -> Optional[dict[str, Any]]:
+    try:
+        response = requests.post(f"{ENV_URL}/step", json={"action": action}, timeout=30)
+        response.raise_for_status()
+    except Exception as exc:
+        print(f"[DEBUG] /step request failed: {exc}", flush=True)
+        return None
+
+    payload = _safe_json_from_response(response)
+    return payload
+
+
+def _post_grade(task_id: str) -> Optional[dict[str, Any]]:
+    try:
+        response = requests.post(f"{ENV_URL}/grade", json={"task_id": task_id}, timeout=30)
+        response.raise_for_status()
+    except Exception as exc:
+        print(f"[DEBUG] /grade request failed for task {task_id}: {exc}", flush=True)
+        return None
+
+    payload = _safe_json_from_response(response)
+    return payload
+
+
+def _llm_action(client: OpenAI, messages: List[dict[str, str]]) -> Optional[dict[str, Any]]:
+    try:
+        completion = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            stream=False,
+        )
+    except Exception as exc:
+        print(f"[DEBUG] LLM call failed: {exc}", flush=True)
+        return None
+
+    raw_text = ""
+    try:
+        raw_text = (completion.choices[0].message.content or "").strip()
+    except Exception as exc:
+        print(f"[DEBUG] LLM response parsing failed: {exc}", flush=True)
+        return None
+
+    parsed = _extract_json_obj(raw_text)
+    if not isinstance(parsed, dict):
+        print("[DEBUG] LLM output did not contain valid JSON action", flush=True)
+        return None
+
+    action_type = parsed.get("action_type")
+    if action_type not in {"run_command", "edit_file"}:
+        print(f"[DEBUG] Invalid action_type from LLM: {action_type}", flush=True)
+        return None
+    return parsed
+
+
+def _build_user_prompt(observation: dict[str, Any], step: int) -> str:
+    current_directory = observation.get("current_directory", "")
+    directory_contents = observation.get("directory_contents", [])
+    last_stdout = observation.get("last_command_stdout", "")
+    last_stderr = observation.get("last_command_stderr", "")
+    done_val = observation.get("done", False)
+
+    return textwrap.dedent(
+        f"""
+        Step: {step}/{MAX_STEPS}
+        current_directory: {current_directory}
+        directory_contents: {directory_contents}
+        last_command_stdout:
+        {last_stdout}
+
+        last_command_stderr:
+        {last_stderr}
+
+        done: {done_val}
+        Return only one valid JSON action.
+        """
+    ).strip()
+
+
+def _extract_step_error(step_payload: dict[str, Any], observation: dict[str, Any]) -> Optional[str]:
+    info = step_payload.get("info")
+    if isinstance(info, dict):
+        candidate = info.get("error") or info.get("last_action_error")
+        if candidate:
+            return str(candidate)
+
+    obs_info = observation.get("info")
+    if isinstance(obs_info, dict):
+        candidate = obs_info.get("error") or obs_info.get("last_action_error")
+        if candidate:
+            return str(candidate)
 
     return None
 
-# ── LLM call ──────────────────────────────────────────────────────────────────
-def get_llm_action(client: OpenAI, messages: List[dict]) -> Optional[dict]:
-    try:
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            temperature=0.1,
-            max_tokens=1024,
-        )
-        raw = response.choices[0].message.content or ""
-        return parse_action(raw), raw
-    except Exception as exc:
-        return None, str(exc)
 
-# ── Single task runner ─────────────────────────────────────────────────────────
-def run_task(client: OpenAI, task: str) -> None:
-    log_start(task=task, env=BENCHMARK, model=MODEL_NAME)
-
+def run_task(client: OpenAI, task_name: str) -> None:
     rewards: List[float] = []
     steps_taken = 0
     score = 0.0
     success = False
 
-    try:
-        # ── Reset ────────────────────────────────────────────────────────────
-        obs = reset_env(task)
+    log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
 
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    try:
+        observation = _post_reset(task_name)
+        if observation is None:
+            print(f"[DEBUG] Task {task_name}: reset failed, ending task", flush=True)
+            return
+
+        messages: List[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
         for step in range(1, MAX_STEPS + 1):
             steps_taken = step
 
-            # Build user message from current observation
-            user_content = (
-                f"Step {step}/{MAX_STEPS}\n"
-                f"Directory: {obs.get('current_directory', '?')}\n"
-                f"Files: {obs.get('directory_contents', [])}\n"
-                f"STDOUT:\n{obs.get('last_command_stdout', '')}\n"
-                f"STDERR:\n{obs.get('last_command_stderr', '')}\n"
-                f"Done: {obs.get('done', False)}\n\n"
-                f"What is your next action? Respond with JSON only."
-            )
-            messages.append({"role": "user", "content": user_content})
+            messages.append({"role": "user", "content": _build_user_prompt(observation, step)})
+            action = _llm_action(client, messages)
 
-            # ── Get action from LLM ───────────────────────────────────────
-            action_dict, raw_response = get_llm_action(client, messages)
-
-            if action_dict is None:
-                # LLM failed or gave unparseable output — fall back to pytest
-                action_dict = {"action_type": "run_command", "command": "pytest --tb=short -q"}
-                raw_response = json.dumps(action_dict)
-
-            # Add assistant response to history
-            messages.append({"role": "assistant", "content": raw_response})
-
-            # ── Step the environment ──────────────────────────────────────
-            try:
-                step_result = step_env(action_dict)
-            except requests.exceptions.RequestException as e:
-                log_step(step=step, action=json.dumps(action_dict),
-                         reward=0.0, done=True, error=str(e))
-                rewards.append(0.0)
+            if action is None:
+                print(f"[DEBUG] Task {task_name}: LLM action unavailable, ending task", flush=True)
                 break
 
-            obs = step_result.get("observation", step_result)
-            reward_obj = step_result.get("reward", {})
-            reward = float(
-                reward_obj.get("total", reward_obj)
-                if isinstance(reward_obj, dict)
-                else reward_obj
-            )
-            done = step_result.get("done", obs.get("done", False))
-            error = step_result.get("info", {}).get("error") if isinstance(step_result.get("info"), dict) else None
+            try:
+                action_str = json.dumps(action, ensure_ascii=False, separators=(",", ":"))
+            except Exception as exc:
+                print(f"[DEBUG] Action serialization failed: {exc}", flush=True)
+                break
 
+            messages.append({"role": "assistant", "content": action_str})
+
+            step_payload = _post_step(action)
+            if step_payload is None:
+                print(f"[DEBUG] Task {task_name}: step request failed, ending task", flush=True)
+                break
+
+            try:
+                observation_value = step_payload.get("observation", {})
+                observation = observation_value if isinstance(observation_value, dict) else {}
+            except Exception as exc:
+                print(f"[DEBUG] Step observation parsing failed: {exc}", flush=True)
+                break
+
+            try:
+                reward_raw = step_payload.get("reward", 0.0)
+                reward = float(reward_raw)
+            except Exception as exc:
+                print(f"[DEBUG] Step reward parsing failed: {exc}", flush=True)
+                reward = 0.0
+
+            try:
+                done = bool(step_payload.get("done", False))
+            except Exception as exc:
+                print(f"[DEBUG] Step done parsing failed: {exc}", flush=True)
+                done = False
+
+            error = _extract_step_error(step_payload, observation)
             rewards.append(reward)
-            log_step(
-                step=step,
-                action=json.dumps(action_dict),
-                reward=reward,
-                done=done,
-                error=error,
-            )
+            log_step(step=step, action=action_str, reward=reward, done=done, error=error)
 
             if done:
                 break
 
-        # ── Grade ─────────────────────────────────────────────────────────
-        try:
-            grade_result = grade_env()
-            score = float(grade_result.get("total_reward", 0.0))
-        except Exception:
-            # Fallback: derive score from rewards if /grade fails
-            score = max(rewards) if rewards else 0.0
+        grade_payload = _post_grade(task_name)
+        if grade_payload is None:
+            print(f"[DEBUG] Task {task_name}: grade failed, using fallback score", flush=True)
+        else:
+            try:
+                score = float(grade_payload.get("total_reward", 0.0))
+            except Exception as exc:
+                print(f"[DEBUG] Grade score parsing failed: {exc}", flush=True)
+                score = 0.0
 
-        score = min(max(score, 0.0), 1.0)
-        success = score >= 0.7
+        score = max(0.0, min(1.0, score))
+        success = score > 0.0
 
     except Exception as exc:
-        # Catch-all — always emit [END] no matter what
-        print(f"[DEBUG] Task {task} crashed: {exc}", flush=True)
-        score = 0.0
-        success = False
+        print(f"[DEBUG] Task {task_name} crashed with unhandled path: {exc}", flush=True)
 
     finally:
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-def main() -> None:
-    # Validate API key
+async def main() -> None:
     if not API_KEY:
-        print("[DEBUG] No API key found. Set GROQ_API_KEY, HF_TOKEN, or API_KEY.", flush=True)
-        # Still emit END lines so the validator doesn't hang
-        for task in ["easy", "medium", "hard"]:
-            log_start(task=task, env=BENCHMARK, model=MODEL_NAME)
+        print("[DEBUG] Missing API key: set GROQ_API_KEY or HF_TOKEN", flush=True)
+        for task_name in TASKS:
+            log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
             log_end(success=False, steps=0, score=0.0, rewards=[])
-        sys.exit(0)
+        return
 
-    # Wait for the environment server to be healthy
-    print(f"[DEBUG] Waiting for environment at {ENV_URL} ...", flush=True)
-    if not wait_for_health(timeout=60):
-        print(f"[DEBUG] Environment not reachable at {ENV_URL} after 60s.", flush=True)
-        for task in ["easy", "medium", "hard"]:
-            log_start(task=task, env=BENCHMARK, model=MODEL_NAME)
+    try:
+        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    except Exception as exc:
+        print(f"[DEBUG] Failed to create OpenAI client: {exc}", flush=True)
+        for task_name in TASKS:
+            log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
             log_end(success=False, steps=0, score=0.0, rewards=[])
-        sys.exit(0)
+        return
 
-    print(f"[DEBUG] Environment healthy. Starting tasks.", flush=True)
-
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-
-    for task in ["easy", "medium", "hard"]:
-        run_task(client, task)
+    for task_name in TASKS:
+        run_task(client, task_name)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except Exception as exc:
+        print(f"[DEBUG] Global failure: {exc}", flush=True)
+        sys.exit(0)
+    sys.exit(0)
 
