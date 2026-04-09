@@ -4,12 +4,18 @@ from __future__ import annotations
 
 from typing import List, Literal, Optional
 
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 try:
     from openenv.core.env_server.types import Action, Observation, State
 except ImportError:
-    from openenv_core.env_server.types import Action, Observation, State
+    try:
+        from openenv_core.env_server.types import Action, Observation, State
+    except ImportError:
+        # Fallback for local dev without openenv installed
+        Action = BaseModel
+        Observation = BaseModel
+        State = BaseModel
 
 
 class GrevAction(Action):
@@ -35,6 +41,12 @@ class GrevAction(Action):
 
 class GrevObservation(Observation):
     """Observation returned after each step."""
+
+    # These fields are provided by the OpenEnv Observation base class,
+    # but we declare them explicitly so the model works both with and
+    # without the openenv package installed.
+    done: bool = Field(default=False, description="Whether the episode is complete.")
+    reward: float = Field(default=0.0, description="Reward for this step.")
 
     current_directory: str = Field(
         default="",

@@ -5,7 +5,10 @@ from __future__ import annotations
 try:
     from openenv.core.env_server.http_server import create_app
 except ImportError:
-    from openenv_core.env_server.http_server import create_app
+    try:
+        from openenv_core.env_server.http_server import create_app
+    except ImportError:
+        create_app = None
 
 try:
     from grev.models import GrevAction, GrevObservation

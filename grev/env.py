@@ -17,7 +17,11 @@ from typing import Dict, List, Optional, Tuple
 try:
     from openenv.core.env_server.interfaces import Environment
 except ImportError:
-    from openenv_core.env_server.interfaces import Environment
+    try:
+        from openenv_core.env_server.interfaces import Environment
+    except ImportError:
+        # Fallback for local dev without openenv installed
+        Environment = object
 
 try:
     from grev.models import GrevAction, GrevObservation, GrevState
