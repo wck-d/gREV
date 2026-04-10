@@ -69,14 +69,29 @@ TASK_CONFIGS: Dict[str, TaskConfig] = {
         test_count=15,
         time_budget=20.0,
     ),
+    "medium_hard": TaskConfig(
+        task_level="medium_hard",
+        max_steps=18,
+        bug_count=3,
+        test_count=16,
+        time_budget=18.0,
+    ),
+    "very_hard": TaskConfig(
+        task_level="very_hard",
+        max_steps=24,
+        bug_count=4,
+        test_count=27,
+        time_budget=24.0,
+    ),
 }
 
-# Reward component weights — mirrors professional code-review quality dimensions
+# Reward component weights — rebalanced for cross-model consistency
+# test_pass_rate gets majority weight as the most deterministic signal
 REWARD_WEIGHTS = {
-    "test_pass_rate": 0.45,      # how many tests pass (primary signal)
-    "diagnosis_quality": 0.20,   # did the agent read the right files?
-    "fix_efficiency": 0.20,      # fewer steps = higher efficiency
-    "penalty_avoidance": 0.15,   # avoiding bad actions (invalid edits, timeouts)
+    "test_pass_rate": 0.60,      # primary signal — fully deterministic
+    "diagnosis_quality": 0.20,   # did the agent investigate before editing?
+    "fix_efficiency": 0.10,      # gentle tiebreaker, never zeros out a correct fix
+    "penalty_avoidance": 0.10,   # clean execution bonus
 }
 
 
@@ -94,15 +109,42 @@ class RepairGrader:
         self._invalid_actions: int = 0
         self._timeout_count: int = 0
         self._best_pass_rate: float = 0.0
+        # Stall tracking: consecutive steps with unchanged pass rate and no edit
+        self._stall_streak: int = 0
+        self._last_recorded_rate: float = -1.0  # sentinel
+        self._stall_penalties: float = 0.0
 
     def record_read(self, filename: str) -> None:
         self._files_read.add(filename)
 
     def record_edit(self, filename: str) -> None:
         self._files_edited.add(filename)
+        # Any edit resets the stall streak
+        self._stall_streak = 0
 
     def record_pytest_run(self) -> None:
         self._pytest_runs += 1
+
+    def record_stall(self, current_pass_rate: float) -> None:
+        """Call once per step to detect progress-free loops.
+
+        If pass rate hasn't changed and no edit was made in this step,
+        increment the stall streak. After 3 consecutive stall steps,
+        apply a small penalty per additional stale step (0.04 per step).
+        Resets when pass rate improves or an edit is recorded.
+        """
+        if current_pass_rate > self._last_recorded_rate:
+            # Progress made — reset stall streak
+            self._stall_streak = 0
+        else:
+            self._stall_streak += 1
+            # Grace period: 3 stall steps before any penalty
+            if self._stall_streak > 3:
+                penalty = 0.04
+                self._stall_penalties += penalty
+                self._penalties += penalty
+
+        self._last_recorded_rate = current_pass_rate
 
     def record_invalid_action(self) -> None:
         self._invalid_actions += 1
@@ -116,34 +158,47 @@ class RepairGrader:
         self._best_pass_rate = max(self._best_pass_rate, rate)
 
     def test_pass_rate_score(self, passed: int, total: int) -> float:
-        """Primary grading component: fraction of tests passing."""
-        if total == 0:
+        """Primary grading component: fraction of tests passing.
+
+        Uses config.test_count as fallback denominator when pytest can't collect
+        (e.g. SyntaxError prevents collection). This ensures consistent scoring
+        regardless of how the model approaches the task.
+        """
+        # Fallback: if pytest reported 0 total (collection failure), use known count
+        effective_total = total if total > 0 else self.config.test_count
+        if effective_total == 0:
             return 0.0
-        return _clamp(passed / total)
+        return _clamp(passed / effective_total)
 
     def diagnosis_quality_score(self) -> float:
-        """Did the agent investigate properly before editing?"""
+        """Did the agent investigate properly before editing?
+
+        Smooth 0-1 scale rewarding breadth of investigation.
+        Model-agnostic: doesn't reward any specific action sequence.
+        """
         score = 0.0
-        # Reward reading files before editing
-        if self._pytest_runs >= 1:
-            score += 0.3
-        if len(self._files_read) >= 1:
-            score += 0.3
-        # Reading more files shows better diagnosis
-        if len(self._files_read) >= 2:
-            score += 0.2
-        # Editing files shows the agent attempted a fix
-        if len(self._files_edited) >= 1:
-            score += 0.2
+        if self._pytest_runs >= 1:        # ran pytest to see what's broken
+            score += 0.35
+        if len(self._files_read) >= 1:    # read at least one source file
+            score += 0.30
+        if len(self._files_read) >= 2:    # cross-file investigation
+            score += 0.20
+        if len(self._files_edited) >= 1:  # attempted a fix
+            score += 0.15
         return _clamp(score)
 
     def fix_efficiency_score(self, steps_taken: int) -> float:
-        """Reward faster fixes; penalize wasteful exploration."""
-        if self._best_pass_rate == 0.0:
-            return 0.0  # no reward for efficiency if nothing was fixed
+        """Efficiency tiebreaker — never punishes slow-but-correct models.
+
+        Only applied when agent achieved >=50% pass rate (made real progress).
+        Decays from 1.0 to 0.5 across the full budget, so a model using every
+        step still gets 0.5 here — efficiency can only help, not destroy.
+        """
+        if self._best_pass_rate < 0.5:
+            return 0.0  # no efficiency credit without meaningful progress
         max_steps = self.config.max_steps
-        # Linear decay: full score at step 1, zero at max_steps
-        efficiency = 1.0 - (steps_taken / max_steps)
+        # Floors at 0.5: even at max_steps, efficiency = 1.0 - 0.5*(1.0) = 0.5
+        efficiency = 1.0 - 0.5 * (steps_taken / max_steps)
         return _clamp(efficiency)
 
     def penalty_avoidance_score(self) -> float:
@@ -261,22 +316,15 @@ class gREVEnv(Environment):
         self._last_passed = passed
         self._last_total = total
 
-        current_pass_rate = passed / total if total > 0 else 0.0
+        # Use config.test_count as denominator fallback for collection failures
+        effective_total = total if total > 0 else self._config.test_count
+        current_pass_rate = passed / effective_total if effective_total > 0 else 0.0
         self._grader.update_best_pass_rate(current_pass_rate)
+        self._grader.record_stall(current_pass_rate)  # stall penalty if looping
 
-        # Intermediate reward = weighted composite of all components
+        # Composite reward — deterministic, no path-dependent delta shaping
         components = self._grader.aggregate_score(passed, total, self._step_count)
-        step_reward = components["total"]
-
-        # Bonus/penalty based on progress delta (reward shaping)
-        delta = current_pass_rate - self._prev_pass_rate
-        if delta > 0:
-            step_reward += 0.1 * delta  # small bonus for progress
-        elif delta < 0:
-            step_reward -= 0.05 * abs(delta)  # penalize regression
-        step_reward = _clamp(step_reward)
-
-        self._prev_pass_rate = current_pass_rate
+        step_reward = _clamp(components["total"])
 
         # Check done conditions
         done = False

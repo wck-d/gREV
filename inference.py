@@ -25,10 +25,17 @@ except ImportError:
 
 API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
 MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
-HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("API_KEY") or ""
+# Rubric requires reading from OPENAI_API_KEY — support all common env var names
+HF_TOKEN = (
+    os.getenv("HF_TOKEN")
+    or os.getenv("OPENAI_API_KEY")
+    or os.getenv("API_KEY")
+    or ""
+)
 
 BENCHMARK = "grev"
-MAX_STEPS = 8
+# Note: per-episode step budget comes from TASK_CONFIGS, not this constant
+DEFAULT_MAX_STEPS = 24  # upper safety ceiling only
 TEMPERATURE = 0.1
 MAX_TOKENS = 700
 
@@ -100,6 +107,28 @@ def _extract_json_obj(text: str) -> Optional[dict]:
     return None
 
 
+def _normalize_action(parsed: dict) -> Optional[dict]:
+    """Map common LLM mistakes to valid action types.
+
+    LLMs sometimes emit action_type='cat' or 'grep' etc. Normalize these
+    to run_command so episodes don't silently skip steps.
+    """
+    action_type = parsed.get("action_type", "")
+    if action_type in {"run_command", "edit_file"}:
+        return parsed
+
+    # Common LLM mistakes: command-style action types
+    shell_verbs = {"cat", "grep", "ls", "head", "tail", "pytest", "python",
+                   "run", "execute", "bash", "shell", "command"}
+    if action_type.lower() in shell_verbs:
+        command = parsed.get("command") or parsed.get("cmd") or action_type
+        print(f"[DEBUG] Normalized action_type={action_type!r} to run_command", flush=True)
+        return {"action_type": "run_command", "command": command}
+
+    print(f"[DEBUG] Invalid action_type from LLM: {action_type}", flush=True)
+    return None
+
+
 def _llm_action(client: OpenAI, messages: list) -> Optional[dict]:
     """Ask the LLM for the next action."""
     try:
@@ -120,18 +149,15 @@ def _llm_action(client: OpenAI, messages: list) -> Optional[dict]:
         print("[DEBUG] LLM output did not contain valid JSON action", flush=True)
         return None
 
-    action_type = parsed.get("action_type")
-    if action_type not in {"run_command", "edit_file"}:
-        print(f"[DEBUG] Invalid action_type from LLM: {action_type}", flush=True)
-        return None
-    return parsed
+    return _normalize_action(parsed)
 
 
-def _build_user_prompt(obs, step: int) -> str:
+
+def _build_user_prompt(obs, step: int, max_steps: int) -> str:
     """Build the user prompt from the observation."""
     return textwrap.dedent(
         f"""
-        Step: {step}/{MAX_STEPS}
+        Step: {step}/{max_steps}
         current_directory: {obs.current_directory}
         directory_contents: {obs.directory_contents}
         last_command_stdout:
@@ -140,6 +166,7 @@ def _build_user_prompt(obs, step: int) -> str:
         last_command_stderr:
         {obs.last_command_stderr}
 
+        reward_so_far: {obs.reward:.3f}
         done: {obs.done}
         Return only one valid JSON action.
         """
@@ -147,50 +174,63 @@ def _build_user_prompt(obs, step: int) -> str:
 
 
 def _deterministic_action(obs, step: int, task: str) -> Optional[dict]:
-    """Rule-based fallback when LLM is unavailable."""
-    if step == 1:
-        return {"action_type": "run_command", "command": "pytest"}
+    """Rule-based fallback when LLM is unavailable or fails to produce JSON.
 
+    Never returns None after step 1 — always keeps the episode alive by
+    re-running pytest so the agent continues getting reward signal.
+    """
     stdout = obs.last_command_stdout or ""
 
-    # After pytest, cat the broken file(s) to understand the problem
-    if step == 2:
-        if task == "easy":
-            return {"action_type": "run_command", "command": "cat calculator.py"}
-        elif task == "medium":
-            return {"action_type": "run_command", "command": "cat data_processor.py"}
-        elif task == "hard":
-            return {"action_type": "run_command", "command": "cat auth.py"}
+    if step == 1:
+        return {"action_type": "run_command", "command": "pytest -v"}
 
-    # For hard task, also read models.py on step 3
+    # After pytest, read the main broken file
+    task_files = {
+        "easy": "calculator.py",
+        "medium": "data_processor.py",
+        "hard": "auth.py",
+        "medium_hard": "pipeline.py",
+        "very_hard": "storage.py",
+    }
+    if step == 2:
+        return {"action_type": "run_command", "command": f"cat {task_files.get(task, 'main.py')}"}
+
+    # For cross-file tasks, read the second file on step 3
     if step == 3 and task == "hard":
         return {"action_type": "run_command", "command": "cat models.py"}
+    if step == 3 and task == "very_hard":
+        return {"action_type": "run_command", "command": "cat test_storage.py"}
 
-    return None
+    # Keep running pytest to track progress — never return None
+    return {"action_type": "run_command", "command": "pytest -v"}
 
 
 def _run_episode(task: str, seed: int) -> float:
     """Run a single task episode."""
-    # Required by submission rules: create OpenAI client
+    from grev.env import TASK_CONFIGS  # use per-task step budget
+
     client = _build_llm_client()
     use_llm = bool(HF_TOKEN)
 
     env = gREVEnv()
     obs = env.reset(task_level=task, seed=seed)
 
+    # Use the task's configured step budget, not a hardcoded constant
+    task_max_steps = TASK_CONFIGS.get(task, TASK_CONFIGS["easy"]).max_steps
+
     rewards: list[float] = []
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     log_start(task=task, env=BENCHMARK, model=MODEL_NAME)
 
-    for step in range(1, MAX_STEPS + 1):
+    for step in range(1, task_max_steps + 1):
         if obs.done:
             break
 
         # Get action from LLM or fallback
         action_dict = None
         if use_llm:
-            messages.append({"role": "user", "content": _build_user_prompt(obs, step)})
+            messages.append({"role": "user", "content": _build_user_prompt(obs, step, task_max_steps)})
             action_dict = _llm_action(client, messages)
 
         if action_dict is None:
@@ -247,13 +287,13 @@ def _run_episode(task: str, seed: int) -> float:
 
 def _task_list(task_arg: str) -> Iterable[str]:
     if task_arg == "all":
-        return ["easy", "medium", "hard"]
+        return ["easy", "medium", "hard", "medium_hard", "very_hard"]
     return [task_arg]
 
 
 def main():
     parser = argparse.ArgumentParser(description="gREV baseline inference")
-    parser.add_argument("--task", choices=["easy", "medium", "hard", "all"], default="all")
+    parser.add_argument("--task", choices=["easy", "medium", "hard", "medium_hard", "very_hard", "all"], default="all")
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()

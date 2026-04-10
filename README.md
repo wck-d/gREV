@@ -154,10 +154,10 @@ gREV uses a **4-component weighted reward** computed after every step, providing
 
 | Component | Weight | What It Measures |
 |-----------|--------|-----------------|
-| `test_pass_rate` | **0.45** | Fraction of pytest tests currently passing |
+| `test_pass_rate` | **0.60** | Fraction of pytest tests currently passing |
 | `diagnosis_quality` | **0.20** | Did the agent run pytest and read files before editing? |
-| `fix_efficiency` | **0.20** | Fewer steps used = higher score (linear decay) |
-| `penalty_avoidance` | **0.15** | No timeouts or invalid actions = full score |
+| `fix_efficiency` | **0.10** | Fewer steps used = higher score (floors at 0.5) |
+| `penalty_avoidance` | **0.10** | No timeouts or invalid actions = full score |
 
 #### How Grading Works (Step-by-Step)
 
@@ -170,40 +170,30 @@ flowchart TD
     C --> E["📊 Silent pytest evaluation"]
     D --> E
 
-    E --> F["Parse: X passed, Y failed"]
+    E --> F["Parse: X passed, Y failed\n(uses config.test_count if 0 collected)"]
     
     F --> G["Compute 4 components"]
-    G --> G1["test_pass_rate = passed / total\n× 0.45"]
+    G --> G1["test_pass_rate = passed / total\n× 0.60"]
     G --> G2["diagnosis_quality\n× 0.20"]
-    G --> G3["fix_efficiency\n× 0.20"]
-    G --> G4["penalty_avoidance\n× 0.15"]
+    G --> G3["fix_efficiency (floors at 0.5)\n× 0.10"]
+    G --> G4["penalty_avoidance\n× 0.10"]
 
     G1 --> H["Sum weighted components"]
     G2 --> H
     G3 --> H
     G4 --> H
 
-    H --> I{"Pass rate improved\nsince last step?"}
-    I -->|"Yes ↑"| J["+0.10 × delta bonus"]
-    I -->|"No change"| K["No adjustment"]
-    I -->|"Regressed ↓"| L["-0.05 × delta penalty"]
-
-    J --> M["Clamp to 0.0 – 1.0"]
-    K --> M
-    L --> M
-
+    H --> M["Clamp to 0.0 – 1.0"]
     M --> N["✅ Return reward + observation"]
     N --> O{"All tests pass\nOR budget exhausted?"}
     O -->|Yes| P["🏁 Episode done"]
     O -->|No| A
 ```
 
-**Reward shaping adjustments:**
+**Penalty table:**
 
 | Event | Adjustment |
 |-------|-----------|
-| Test pass rate improved since last step | `+0.10 × delta` |
-| Test pass rate regressed | `-0.05 × |delta|` |
 | Command timed out (15s) | `-0.10` penalty |
 | Invalid action (missing fields) | `-0.05` penalty |
 
@@ -213,26 +203,61 @@ All rewards are clamped to `[0.0, 1.0]`.
 
 ## Tasks
 
+5 tasks across a difficulty ladder — each adds a new class of bug that requires deeper reasoning:
+
 ### `easy` — Syntax + Logic Fix
 **Files:** `calculator.py` (2 bugs), `test_calculator.py` (8 tests)
 **Bugs:** Missing colon on `multiply` function def + wrong operator (`+` instead of `*`)
-**Partial credit:** Fixing just the syntax error lets 6/8 tests pass (0.75). Fixing the logic too → 1.0.
+**Partial credit:** Fixing just the syntax error lets 6/8 tests pass. Fixing both → 1.0.
 
 ### `medium` — Multi-Bug Data Pipeline
 **Files:** `data_processor.py` (3 bugs), `test_data_processor.py` (14 tests)
 **Bugs:** Wrong CSV delimiter (`;` → `,`), off-by-one in `calculate_average`, inverted comparison in `filter_above_threshold`
-**Partial credit:** Each bug fix unlocks a cluster of tests. Smooth reward curve as fixes accumulate.
+**Partial credit:** Each bug fix unlocks a cluster of tests. Smooth reward curve.
 
 ### `hard` — Cross-File Import & Logic
-**Files:** `auth.py` (4 bugs) + `models.py` (correct), `test_auth.py` (15 tests)
-**Bugs:** 2 import mismatches (`UserModel` → `User`, `Perm` → `Permission`), inverted permission check, wrong dict key (`uid` → `user_id`)
-**Partial credit:** Import fixes unlock auth tests, logic fix unlocks permission tests, dict key fix unlocks session tests.
+**Files:** `auth.py` (4 bugs) + `models.py`, `test_auth.py` (15 tests)
+**Bugs:** 2 import mismatches, inverted permission check, wrong dict key
+**Partial credit:** Import fixes unlock auth tests, logic fix unlocks permission tests.
+
+### `medium_hard` — Decorator, Generator & Mutation Bugs
+**Files:** `pipeline.py` (3 bugs), `test_pipeline.py` (16 tests)
+**Bugs:** `retry` decorator swallows `return` value; `chunked_reader` generator skips the last partial chunk (`i + chunk_size <= len` instead of `i < len`); `normalize_record` mutates its input dict instead of a copy
+**What makes it hard:** Each bug is a subtle Python pattern (closures, generators, mutability) that looks correct on first read.
+
+### `very_hard` — Abstract Storage Class Hierarchy
+**Files:** `storage.py` (4 bugs across ABC + 3 concrete classes), `test_storage.py` (27 tests)
+**Bugs:** `MemoryStorage` missing `exists()` override; `FileStorage.read()` opens in binary mode (`"rb"`) returning `bytes` not `str`; `CachingStorage.write()` doesn't update cache (stale reads); `BaseStorage.copy()` has wrong argument order
+**What makes it hard:** The bugs span an inheritance chain — each concrete class has a different failure pattern, and `copy()` only breaks when all 3 stores work in isolation.
 
 | Level | Bugs | Tests | Max Steps |
 |-------|------|-------|-----------|
 | easy | 2 | 8 | 12 |
 | medium | 3 | 14 | 16 |
 | hard | 4 | 15 | 20 |
+| medium_hard | 3 | 16 | 18 |
+| very_hard | 4 | 27 | 24 |
+
+---
+
+## Baseline Scores
+
+Run with deterministic fallback agent (no LLM — `pytest` then `cat`, seed 42):
+
+| Task | Fallback score | Expected with LLM |
+|------|---------------|-------------------|
+| easy | 0.23 | ~0.75–1.0 |
+| medium | 0.37 | ~0.60–0.90 |
+| hard | 0.27 | ~0.40–0.70 |
+| medium_hard | 0.44 | ~0.50–0.80 |
+| very_hard | 0.35 | ~0.30–0.60 |
+
+Fallback scores represent the diagnostic signal only (ran pytest + read main file). A strong LLM agent should score significantly higher by actually applying fixes.
+
+Reproduce:
+```bash
+python inference.py --task all --episodes 1 --seed 42
+```
 
 ---
 

@@ -9,11 +9,24 @@ tasks:
   - id: easy
     name: "Syntax + Logic Fix"
     description: "Fix a calculator module with a syntax error (missing colon) and a logic error (wrong operator) so all 8 tests pass."
+    difficulty: easy
 
   - id: medium
     name: "Multi-Bug Data Pipeline"
     description: "Diagnose and fix 3 logic bugs in a data processing pipeline (wrong delimiter, off-by-one, inverted comparison) across 14 tests."
+    difficulty: medium
 
   - id: hard
     name: "Cross-File Import Mismatch"
     description: "Fix 4 bugs across 2 files — 2 import mismatches, 1 inverted logic, and 1 wrong dict key — in an authentication module with 15 tests."
+    difficulty: hard
+
+  - id: medium_hard
+    name: "Decorator, Generator, and Mutation Bugs"
+    description: "Fix 3 Python pattern bugs: a retry decorator that swallows its return value, a chunked generator that skips the last partial chunk, and a normalizer that mutates its input dict. 16 tests."
+    difficulty: medium_hard
+
+  - id: very_hard
+    name: "Abstract Storage Class Hierarchy"
+    description: "Fix 4 bugs across an ABC + 3 concrete implementations: missing abstract method override, binary vs text mode mismatch, stale cache after write, and wrong argument order in a base method. 27 tests."
+    difficulty: very_hard
