@@ -364,21 +364,7 @@ gREV is a live AI agent training environment. The agent reads pytest output, edi
 <span class="method-pill get">GET</span><span class="api-path">/health</span><span class="api-desc">Liveness check</span><span class="api-toggle">›</span>
 </div>
 <div class="api-body"><pre class="api-code">// response
-{"status": "ok", "tasks": ["easy","medium","medium_hard","hard","very_hard"]}</pre></div>
-</div>
-
-<div class="api-card">
-<div class="api-header" onclick="this.parentElement.classList.toggle('open')">
-<span class="method-pill get">GET</span><span class="api-path">/tasks</span><span class="api-desc">List all available tasks</span><span class="api-toggle">›</span>
-</div>
-<div class="api-body"><pre class="api-code">// response
-[
-  {"task_id":"easy","difficulty":"easy","max_steps":12,"reward_range":[0,1]},
-  {"task_id":"medium","difficulty":"medium","max_steps":16,"reward_range":[0,1]},
-  {"task_id":"medium_hard","difficulty":"medium-hard","max_steps":18,"reward_range":[0,1]},
-  {"task_id":"hard","difficulty":"hard","max_steps":20,"reward_range":[0,1]},
-  {"task_id":"very_hard","difficulty":"very-hard","max_steps":24,"reward_range":[0,1]}
-]</pre></div>
+{"status": "healthy"}</pre></div>
 </div>
 
 <div class="api-card open">
@@ -386,17 +372,21 @@ gREV is a live AI agent training environment. The agent reads pytest output, edi
 <span class="method-pill post">POST</span><span class="api-path">/reset</span><span class="api-desc">Start a new episode</span><span class="api-toggle">›</span>
 </div>
 <div class="api-body"><pre class="api-code">// request
-{"task_id": "easy", "seed": 42}
+{"task_level": "easy", "seed": 42}
 
-// response → Observation
+// response (OpenEnv wrapped)
 {
-  "done": false,
-  "reward": 0.0,
-  "current_directory": "/tmp/grev_workspace",
-  "directory_contents": ["calculator.py","test_calculator.py"],
-  "last_command_stdout": "Environment reset to easy...",
-  "last_command_stderr": "",
-  "last_error": null
+  "observation": {
+    "done": false,
+    "reward": 0.0,
+    "current_directory": "/tmp/grev_workspace",
+    "directory_contents": ["calculator.py","test_calculator.py"],
+    "last_command_stdout": "Environment reset to easy...",
+    "last_command_stderr": "",
+    "last_error": null
+  },
+  "reward": null,
+  "done": false
 }</pre></div>
 </div>
 
@@ -404,35 +394,47 @@ gREV is a live AI agent training environment. The agent reads pytest output, edi
 <div class="api-header" onclick="this.parentElement.classList.toggle('open')">
 <span class="method-pill post">POST</span><span class="api-path">/step</span><span class="api-desc">Execute one agent action</span><span class="api-toggle">›</span>
 </div>
-<div class="api-body"><pre class="api-code">// request
-{"action_type":"run_command","command":"pytest -v"}
+<div class="api-body"><pre class="api-code">// request — action must be nested in "action" key
+{"action": {"action_type":"run_command","command":"pytest -v"}}
 
-// response → StepResult
+// response (OpenEnv wrapped)
 {
-  "done": false,
+  "observation": {
+    "done": false,
+    "reward": 0.21,
+    "current_directory": "/tmp/grev_workspace",
+    "last_command_stdout": "...",
+    "last_command_stderr": "",
+    "last_error": null
+  },
   "reward": 0.21,
-  "current_directory": "/tmp/grev_workspace",
-  "last_command_stdout": "...",
-  "last_command_stderr": "",
-  "last_error": null
+  "done": false
 }</pre></div>
 </div>
 
 <div class="api-card">
 <div class="api-header" onclick="this.parentElement.classList.toggle('open')">
-<span class="method-pill post">POST</span><span class="api-path">/grade</span><span class="api-desc">Final episode score</span><span class="api-toggle">›</span>
+<span class="method-pill get">GET</span><span class="api-path">/state</span><span class="api-desc">Current environment state</span><span class="api-toggle">›</span>
 </div>
-<div class="api-body"><pre class="api-code">// response → EpisodeResult
+<div class="api-body"><pre class="api-code">// response
 {
-  "total_reward": 1.000,
-  "steps_taken": 4,
-  "success": true,
-  "components": {
-    "test_pass_rate": 1.0,
-    "diagnosis_quality": 0.85,
-    "fix_efficiency": 0.90,
-    "penalty_avoidance": 1.0
-  }
+  "task_level": "easy",
+  "step_count": 3,
+  "workspace_dir": "/tmp/grev_workspace",
+  "max_steps": 12,
+  "directory_contents": ["calculator.py","test_calculator.py"]
+}</pre></div>
+</div>
+
+<div class="api-card">
+<div class="api-header" onclick="this.parentElement.classList.toggle('open')">
+<span class="method-pill get">GET</span><span class="api-path">/schema</span><span class="api-desc">Action/observation JSON schemas</span><span class="api-toggle">›</span>
+</div>
+<div class="api-body"><pre class="api-code">// response
+{
+  "action": { "type":"object", "properties": {...} },
+  "observation": { "type":"object", "properties": {...} },
+  "state": { "type":"object", "properties": {...} }
 }</pre></div>
 </div>
 
@@ -495,6 +497,12 @@ else{bChar=0;bLine++;bootTimer=setTimeout(typeBoot,200)}
 }
 setTimeout(typeBoot,800);
 
+/* ── TASK FILE MAPPING ── */
+const taskMainFile={
+easy:'calculator.py', medium:'data_processor.py',
+medium_hard:'pipeline.py', hard:'auth.py', very_hard:'storage.py'
+};
+
 /* ── TASK SELECTOR ── */
 const tasksData=[
 {id:'easy',name:'EASY',difficulty:'easy',desc:'Syntax error · calculator.py',maxSteps:12},
@@ -504,7 +512,7 @@ const tasksData=[
 {id:'very_hard',name:'VERY-HARD',difficulty:'very-hard',desc:'ABC hierarchy · storage.py',maxSteps:24},
 ];
 const selectorEl=document.getElementById('task-selector');
-let activeTask=null,sessionReward=0,sessionStep=0,sessionMax=0;
+let activeTask=null,sessionReward=0,sessionStep=0,sessionMax=0,episodeDone=false;
 tasksData.forEach(t=>{
 const card=document.createElement('div');
 card.className='task-card';card.id='task-card-'+t.id;
@@ -513,47 +521,94 @@ card.onclick=()=>selectTask(t);
 selectorEl.appendChild(card);
 });
 
+function updateQuickActions(){
+const qa=document.querySelector('.quick-actions');
+const file=activeTask?taskMainFile[activeTask.id]:'main.py';
+qa.innerHTML='';
+[['pytest','pytest'],['pytest -v','pytest -v'],['cat '+file,'cat '+file],['ls -la','ls -la']].forEach(([label,cmd])=>{
+const btn=document.createElement('button');btn.textContent=label;
+btn.onclick=()=>quickCmd(cmd);qa.appendChild(btn);
+});
+}
+
 function selectTask(t){
-activeTask=t;sessionStep=0;sessionReward=0;sessionMax=t.maxSteps;
+activeTask=t;sessionStep=0;sessionReward=0;sessionMax=t.maxSteps;episodeDone=false;
 document.querySelectorAll('.task-card').forEach(c=>c.classList.remove('active'));
 document.getElementById('task-card-'+t.id).classList.add('active');
-updateReward(0);updateStep();
+updateReward(0);updateStep();updateQuickActions();
 appendOutput('Resetting to '+t.name+'...','info');
 fetch('/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({task_level:t.id,seed:42})})
-.then(r=>r.json()).then(d=>{appendOutput(d.last_command_stdout||'Environment ready.','pass')})
-.catch(e=>appendOutput('Error: '+e.message,'fail'));
+.then(r=>{if(!r.ok)return r.text().then(t=>{throw new Error('HTTP '+r.status+': '+t)});return r.json()})
+.then(d=>{
+/* OpenEnv wraps: {observation:{...}, done, reward} */
+const obs=d.observation||d;
+const msg=obs.last_command_stdout||'Environment ready.';
+appendOutput(msg,'pass');
+if(obs.directory_contents&&obs.directory_contents.length){
+appendOutput('Files: '+obs.directory_contents.join(', '),'info');
+}
+})
+.catch(e=>appendOutput('Reset error: '+e.message,'fail'));
 }
 
 /* ── LIVE OUTPUT ── */
 const outputEl=document.getElementById('live-output');
-function appendOutput(text,cls='info'){const d=document.createElement('div');d.className='out-line '+cls;d.textContent=text;outputEl.appendChild(d);outputEl.scrollTop=outputEl.scrollHeight}
+function appendOutput(text,cls='info'){
+if(!text)return;
+const lines=text.split('\n');
+lines.forEach(line=>{
+if(!line&&lines.length>1)return;
+const d=document.createElement('div');d.className='out-line '+cls;d.textContent=line;outputEl.appendChild(d);
+});
+outputEl.scrollTop=outputEl.scrollHeight;
+}
 
 /* ── COMMANDS ── */
 const inputEl=document.getElementById('live-input');
 inputEl.addEventListener('keydown',e=>{if(e.key==='Enter'){const cmd=inputEl.value.trim();if(!cmd)return;inputEl.value='';sendStep(cmd)}});
-function quickCmd(cmd){inputEl.value=cmd;sendStep(cmd)}
+function quickCmd(cmd){inputEl.value='';sendStep(cmd)}
 
 function sendStep(command){
 if(!activeTask){appendOutput('Select a task first.','warn');return}
+if(episodeDone){appendOutput('Episode ended. Select a task to start a new one.','warn');return}
 appendOutput('$ '+command,'info');
 sessionStep++;updateStep();
-fetch('/step',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action_type:'run_command',command})})
-.then(r=>r.json()).then(d=>{
-if(d.last_command_stdout)appendOutput(d.last_command_stdout,d.last_command_stdout.includes('passed')?'pass':'info');
-if(d.last_command_stderr)appendOutput(d.last_command_stderr,'fail');
-if(d.last_error)appendOutput('Error: '+d.last_error,'warn');
-if(typeof d.reward==='number'){animateReward(sessionReward,d.reward);sessionReward=d.reward}
-if(d.done)appendOutput('Episode done.','warn');
+/* OpenEnv /step expects: {action: {action_type, command, ...}} */
+const payload={action:{action_type:'run_command',command:command}};
+fetch('/step',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
+.then(r=>{if(!r.ok)return r.text().then(t=>{throw new Error('HTTP '+r.status+': '+t)});return r.json()})
+.then(d=>{
+/* OpenEnv wraps: {observation:{...}, reward, done} */
+const obs=d.observation||d;
+const reward=d.reward!=null?d.reward:(obs.reward!=null?obs.reward:null);
+const done=d.done||(obs.done===true);
+if(obs.last_command_stdout){
+const stdout=obs.last_command_stdout;
+const cls=stdout.includes(' passed')&&!stdout.includes(' failed')?'pass':
+stdout.includes('PASSED')?'pass':
+stdout.includes('FAILED')||stdout.includes('failed')||stdout.includes('Error')?'fail':'info';
+appendOutput(stdout,cls);
+}
+if(obs.last_command_stderr)appendOutput(obs.last_command_stderr,'fail');
+if(obs.last_error)appendOutput('Error: '+obs.last_error,'warn');
+if(typeof reward==='number'){animateReward(sessionReward,reward);sessionReward=reward}
+if(done){episodeDone=true;appendOutput('═══ Episode complete. Final reward: '+(typeof reward==='number'?reward.toFixed(3):'—')+' ═══','pass');}
 }).catch(e=>appendOutput('Network error: '+e.message,'fail'));
 }
 
 function doGrade(){
 if(!activeTask){appendOutput('No active session.','warn');return}
-fetch('/grade',{method:'POST'}).then(r=>r.json()).then(d=>{
-const score=d.total_reward||d[0]||0;
-appendOutput('GRADE: '+score.toFixed(3),'pass');
-animateReward(sessionReward,score);sessionReward=score;
-}).catch(e=>appendOutput('Grade error: '+e.message,'fail'));
+/* No /grade endpoint — use /state to show current progress, then report last reward */
+appendOutput('Fetching environment state...','info');
+fetch('/state').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json()})
+.then(d=>{
+appendOutput('Task: '+(d.task_level||'—')+'  Steps: '+(d.step_count||0)+'/'+(d.max_steps||'—'),'info');
+appendOutput('Current reward: '+sessionReward.toFixed(3),'pass');
+if(d.directory_contents)appendOutput('Workspace: '+d.directory_contents.join(', '),'info');
+}).catch(e=>{
+/* Fallback: just show accumulated reward */
+appendOutput('Score so far: '+sessionReward.toFixed(3),'pass');
+});
 }
 
 /* ── REWARD ANIMATION ── */
